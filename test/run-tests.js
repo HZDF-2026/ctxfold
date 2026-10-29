@@ -80,6 +80,21 @@ t('P3 pinned/system 永不压缩', () => {
   assert(out.includes('宪法 8 条'), 'system 全文必须保留');
 });
 
+t('T1 模板挖掘（ETH 降指数方法论：重复结构跨消息降为引用）', async () => {
+  const D = tmp();
+  const f = path.join(D, 's.jsonl');
+  const lines = [];
+  for (let i = 0; i < 100; i++) {
+    lines.push(JSON.stringify({ role: 'tool', content: `run #${i}\npass 1 complete 0x${(i*991).toString(16)}abcd00112233\nverify step 2 ok score ${i}\nduration 123ms` }));
+  }
+  fs.writeFileSync(f, lines.join('\n') + '\n');
+  const before = CF.tok(lines.map(l => JSON.parse(l).content).join(' '));
+  const st = await CF.compress(f, f + '.o', { model: 'deepseek-flash', profile: CF.PROFILES['deepseek-flash'], budget: 999999, toolFold: 999999, head: 6, tail: 4, recent: 20, gistLen: 120 });
+  const outTxt = fs.readFileSync(f + '.o', 'utf8');
+  assert(outTxt.includes('⟨§'), '重复模板应降为引用');
+  assert(st.out_tok < before * 0.5, `模板化应省 50%+，实际 ${st.out_tok}/${before}`);
+});
+
 (async () => {
   for (const [n, f] of tests) { try { await f(); pass++; console.log('PASS ' + n); } catch (e) { fail++; console.log('FAIL ' + n + ': ' + e.message); } }
   console.log(`\n${pass} passed, ${fail} failed`);

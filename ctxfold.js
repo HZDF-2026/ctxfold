@@ -63,6 +63,23 @@ function gist(text, maxLen) {
   return cut + (t.length > maxLen ? ` …[裁断, 全文 ${tok(t)} tok]` : '');
 }
 
+// ---------- 模板挖掘（ETH 反例方法论：利用重复结构降表达成本） ----------
+// 规范化：数字/哈希→占位符；同模板首次出现保留原文（即模板），后续出现替换为引用+计数。
+// 变量值（数字/哈希）已由锚点层兜底，此处只降结构成本。确定性：Map 顺序稳定。
+function templatize(tpl, text) {
+  const lines = text.split('\n');
+  if (lines.length < 3) return text;
+  const out = lines.map(l => {
+    if (l.length < 8) return l;
+    const norm = l.replace(/[0-9a-f]{12,}/gi, '⟨H⟩').replace(/\d+/g, '⟨N⟩');
+    let hit = tpl.get(norm);
+    if (hit === undefined) { tpl.set(norm, [1, null]); return l; }
+    hit[0]++;
+    return `⟨§${hit[1] === null ? '?' : hit[1]}⟩x${hit[0]}`;
+  });
+  return out.join('\n');
+}
+
 // ---------- 压缩主逻辑 ----------
 // 输入行: {role, content, pinned?, kind?}  kind: system|chat|tool（默认按 role 推断）
 async function compress(inFile, outFile, opts) {
@@ -92,7 +109,15 @@ async function compress(inFile, outFile, opts) {
     while (anchorTok > anchorBudget && anchorList.length > 20) anchorTok -= tok(anchorList.shift()) + 1;
   }
 
-  // 第 2 遍：tool 长输出一律折叠（确定性最大收益）
+  // 第 2 遍：tool 长输出先模板化（重复结构跨消息共享字典，降为引用）再折叠
+  const tpl = new Map(); let tplId = 0;
+  for (const c of cls) {
+    if (c.kind === 'tool' && c.tok > 10) {
+      c.m.content = templatize(tpl, c.m.content);
+      for (const v of tpl.values()) if (v[1] === null) v[1] = tplId++;
+      c.tok = tok(c.m.content);
+    }
+  }
   for (const c of cls) {
     if (c.kind === 'tool' && c.tok > opts.toolFold) {
       c.m.content = fold(c.m.content, opts.head, opts.tail);
@@ -101,11 +126,12 @@ async function compress(inFile, outFile, opts) {
   }
   // 预算判定
   const cur = () => anchorTok + 40 + cls.reduce((n, c) => n + c.tok, 0);
-  const chatOld = cls.filter(c => c.kind === 'chat').sort((a, b) => a.i - b.i);
+  // 可衰减池：chat + tool（agent 会话 tool 常是大头）；system/pinned 永不衰减
+  const demotable = cls.filter(c => c.kind !== 'system').sort((a, b) => a.i - b.i);
   // 三级衰减（从最老开始，达标即停）：要点 → 索引 → 删除（事实已由 ANCHORS 兜底）
   const demote = (start, level) => {
-    for (let k = start; k < chatOld.length && cur() > budget; k++) {
-      const c = chatOld[k];
+    for (let k = start; k < demotable.length && cur() > budget; k++) {
+      const c = demotable[k];
       if (level === 1) { if (!c.m.content.startsWith('[要点]')) { c.m.content = `[要点] ${gist(c.m.content, opts.gistLen)}`; c.tok = tok(c.m.content); nGist++; } }
       else if (level === 2) { if (!c.m.content.startsWith('[索引]')) { c.m.content = `[索引] #${c.i} ${gist(c.m.content, 30)}`; c.tok = tok(c.m.content); nGist++; } }
       else { c.m.content = `[删除] #${c.i}`; c.tok = 6; nGist++; }
@@ -114,6 +140,15 @@ async function compress(inFile, outFile, opts) {
   demote(0, 1);
   if (cur() > budget) demote(opts.recent, 2); // 二级跳过最近 N 条
   if (cur() > budget) demote(0, 3);
+  // 第 4 级：墓碑聚合（数千条 [删除] 行本身占地板——合并成单行区间声明）
+  if (cur() > budget) {
+    const dead = demotable.filter(c => c.m.content.startsWith('[删除]'));
+    if (dead.length > 1) {
+      dead[0].m.content = `[已折叠] ${dead.length} 条消息（#${dead[0].i}-#${dead[dead.length - 1].i}，事实在 ANCHORS）`;
+      dead[0].tok = tok(dead[0].m.content);
+      for (const c of dead.slice(1)) { c.m.content = ''; c.tok = 1; }
+    }
+  }
   outTok = cur(); nKeep = cls.length;
 
   // 输出（stats 不入文件——保证确定性）
@@ -166,5 +201,5 @@ async function main() {
   }
 }
 const die = m => { console.error('ctxfold: ' + m); process.exit(1); };
-main().catch(e => die(e.stack || e.message));
+if (require.main === module) main().catch(e => die(e.stack || e.message));
 module.exports = { tok, anchors, fold, gist, PROFILES, compress };
