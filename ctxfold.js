@@ -126,20 +126,34 @@ async function compress(inFile, outFile, opts) {
   }
   // 预算判定
   const cur = () => anchorTok + 40 + cls.reduce((n, c) => n + c.tok, 0);
-  // 可衰减池：chat + tool（agent 会话 tool 常是大头）；system/pinned 永不衰减
-  const demotable = cls.filter(c => c.kind !== 'system').sort((a, b) => a.i - b.i);
-  // 三级衰减（从最老开始，达标即停）：要点 → 索引 → 删除（事实已由 ANCHORS 兜底）
-  const demote = (start, level) => {
-    for (let k = start; k < demotable.length && cur() > budget; k++) {
-      const c = demotable[k];
-      if (level === 1) { if (!c.m.content.startsWith('[要点]')) { c.m.content = `[要点] ${gist(c.m.content, opts.gistLen)}`; c.tok = tok(c.m.content); nGist++; } }
-      else if (level === 2) { if (!c.m.content.startsWith('[索引]')) { c.m.content = `[索引] #${c.i} ${gist(c.m.content, 30)}`; c.tok = tok(c.m.content); nGist++; } }
-      else { c.m.content = `[删除] #${c.i}`; c.tok = 6; nGist++; }
+  // 可衰减池：chat + tool；system/pinned 永不衰减
+  const demotable = cls.filter(c => c.kind !== 'system');
+  // 价值画像（前沿 KV-cache 预算分配的文本层对应）：
+  // 独占锚点（本条贡献且近期不重复出现的事实）× 新颖度（模板化消息价值低）× 新近权重
+  const recentText = cls.slice(-Math.min(40, cls.length)).map(c => c.m.content).join(' ');
+  const value = new Map();
+  for (const c of demotable) {
+    const mine = anchors(c.m.content);
+    let uniq = 0;
+    for (const a of mine) if (!recentText.includes(a)) uniq++;
+    const novel = c.m.content.includes('⟨§') ? 0.6 : 1;
+    value.set(c.i, (1 + uniq * 0.5) * novel * (1 / (1 + (cls.length - c.i) / Math.max(1, cls.length))));
+  }
+  // 裁剪顺序：边际价值升序（低价值先裁，全局排序而非按年龄顺序贪心）
+  const byValue = [...demotable].sort((a, b) => value.get(a.i) - value.get(b.i));
+  const recentIds = new Set(cls.slice(-Math.min(opts.recent, cls.length)).map(c => c.i));
+  const demote = (level) => {
+    for (const c of byValue) {
+      if (cur() <= budget) break;
+      if (recentIds.has(c.i)) continue; // 最近 N 条原文永不降级
+      if (level === 1 && !c.m.content.startsWith('[')) { c.m.content = `[要点] ${gist(c.m.content, opts.gistLen)}`; c.tok = tok(c.m.content); nGist++; }
+      else if (level === 2 && !c.m.content.startsWith('[索引]') && !c.m.content.startsWith('[删除]')) { c.m.content = `[索引] #${c.i} ${gist(c.m.content, 30)}`; c.tok = tok(c.m.content); nGist++; }
+      else if (level === 3) { c.m.content = `[删除] #${c.i}`; c.tok = 6; nGist++; }
     }
   };
-  demote(0, 1);
-  if (cur() > budget) demote(opts.recent, 2); // 二级跳过最近 N 条
-  if (cur() > budget) demote(0, 3);
+  demote(1);
+  if (cur() > budget) demote(2);
+  if (cur() > budget) demote(3);
   // 第 4 级：墓碑聚合（数千条 [删除] 行本身占地板——合并成单行区间声明）
   if (cur() > budget) {
     const dead = demotable.filter(c => c.m.content.startsWith('[删除]'));

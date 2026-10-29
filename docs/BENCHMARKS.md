@@ -31,6 +31,27 @@ On 2026-10-26, OpenAI and Anthropic each published machine-checked refutations o
 
 What ctxfold does *not* claim: semantic/meaning preservation. LLMLingua wins on meaning-sensitive summarization tasks; ctxfold wins on speed (2–3 orders of magnitude), determinism, zero inference dependency, and explicit fact anchoring. Different tools for different failure modes — pair them if you need both.
 
+## The real frontier: KV-cache-layer compression (one generation ahead of text-layer tools)
+
+An honest generation gap: the methods above — including ctxfold — compress **text before inference**. The current open-source frontier compresses the **KV state inside the model**, which no text-layer tool can reach:
+
+| System (open source) | Measured result | Mechanism |
+|---|---|---|
+| **SnapKV** | 87.5% prefill KV reduction, 96.8% LongBench retrieval accuracy | observation-window attention profiling per query position |
+| **DeltaKV** (2026) | KV memory to 29% (≈3.4x), near-lossless on LongBench/AIME; up to 2x vLLM throughput | **long-range similarity residuals** — store deltas against similar earlier states |
+| **MixedDimKV** (2026) | beats H2O/SnapKV/PyramidKV under **tight budgets** | per-head importance profiling + **mixed-dimension budget allocation** |
+| **PyramidKV** | layer-wise budget pyramid | more budget to upper/lower layers |
+
+## What ctxfold imports from them (v1.1 math)
+
+Text layer can't touch KV, but the *allocation mathematics* transfers, and v1.1 adopts the frontier's core idea — **budget allocation by importance profile, not by age order**:
+
+1. **Value-weighted eviction (MixedDimKV/DeltaKV analog)**: every demotable message gets a marginal-value score — `exclusive anchors × novelty × recency` — and pruning proceeds in *ascending value order* (lowest marginal value first), replacing the previous age-ordered greedy pass. Under tight budgets, the messages that survive are the ones carrying unique facts, not merely the newest ones (test V1: a lone decision message buried under 30 filler messages keeps its facts through the ANCHORS/gist layers).
+2. **Novelty discount (DeltaKV analog)**: template-mined messages (repeated structure) count as low-novelty — they are the residual states of the conversation, exactly what DeltaKV compresses hardest, and are evicted first.
+3. **Anchor exclusivity = a text-layer sufficient statistic**: an anchor that no recent message repeats is treated as irreducible information; one already echoed nearby is safely droppable — a rate-distortion-flavored marginal decision.
+
+Remaining gap (stated plainly): a 100x-ish *KV-level* compression with model-quality metrics (LongBench-class) is one generation beyond any deterministic text tool. The realistic stack is: **ctxfold (text budget, deterministic, instant) → engine-level KV compression (SnapKV/DeltaKV-class) → LLM summarization (semantic)**. Each layer feeds the next; they are complements, not competitors.
+
 ## Sources
 
 - LLMLingua: [Microsoft Research project page](https://www.microsoft.com/en-us/research/project/llmlingua/) (20x claim), [arXiv 2310.05736](https://arxiv.org/abs/2310.05736)

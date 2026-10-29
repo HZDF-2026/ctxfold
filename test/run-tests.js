@@ -95,6 +95,18 @@ t('T1 模板挖掘（ETH 降指数方法论：重复结构跨消息降为引用�
   assert(st.out_tok < before * 0.5, `模板化应省 50%+，实际 ${st.out_tok}/${before}`);
 });
 
+t('V1 价值加权裁剪（边际价值排序：高独占锚点的老消息存活更久）', async () => {
+  const D = tmp();
+  const f = path.join(D, 's.jsonl');
+  const lines = [];
+  for (let i = 0; i < 30; i++) lines.push(JSON.stringify({ role: 'user', content: '普通对话 ' + i + ' ' + '废话'.repeat(60) }));
+  lines.splice(10, 0, JSON.stringify({ role: 'user', content: '关键决定：必须用 sqlite 而非 mysql，工单号 T-7742，阈值 0.85 不得改动，路径 C:/prod/config.env' }));
+  fs.writeFileSync(f, lines.join('\n') + '\n');
+  await CF.compress(f, f + '.o', { model: 'deepseek-flash', profile: CF.PROFILES['deepseek-flash'], budget: 2500, toolFold: 400, head: 6, tail: 4, recent: 3, gistLen: 100 });
+  const out = fs.readFileSync(f + '.o', 'utf8');
+  assert(out.includes('sqlite') || out.includes('T-7742'), '高价值老消息的事实应经要点/锚点保留');
+});
+
 (async () => {
   for (const [n, f] of tests) { try { await f(); pass++; console.log('PASS ' + n); } catch (e) { fail++; console.log('FAIL ' + n + ': ' + e.message); } }
   console.log(`\n${pass} passed, ${fail} failed`);
