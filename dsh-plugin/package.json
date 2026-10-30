@@ -1,0 +1,25 @@
+{
+  "name": "@local/dsh-compaction-ctxfold",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ctxfold compaction backend for DeepSeek Harness: a drop-in BasicCompactionEngine subclass whose summarize() runs the deterministic ctxfold pipeline (zero LLM calls, verbatim anchors, fold-by-hash) instead of ctx.llm.stream().",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "summary.js",
+    "ctxfold.cjs",
+    "cordis.patch.yml"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-compaction-basic": ">=0.2.0-rc.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
