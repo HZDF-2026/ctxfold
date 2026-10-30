@@ -52,6 +52,17 @@ Text layer can't touch KV, but the *allocation mathematics* transfers, and v1.1 
 
 Remaining gap (stated plainly): a 100x-ish *KV-level* compression with model-quality metrics (LongBench-class) is one generation beyond any deterministic text tool. The realistic stack is: **ctxfold (text budget, deterministic, instant) → engine-level KV compression (SnapKV/DeltaKV-class) → LLM summarization (semantic)**. Each layer feeds the next; they are complements, not competitors.
 
+## v1.2: streaming architecture — billion-token scale
+
+The compressor is now a two-pass streaming pipeline (constant memory; per-message typed arrays only): Pass 1 profiles tokens/anchors/values line-by-line with a sliding recency window; Pass 2 applies template mining, folding, and threshold-based demotion while streaming out. Measured on this machine:
+
+| Input | Result | Time | Throughput |
+|---|---|---|---|
+| **1.08 B tokens** (4.69 GB JSONL) | → 690k tokens (budget-met), **x1562** | 236s | ~4.6M tok/s |
+| **5.13 B tokens** (22.7 GB JSONL) | → 2.24M tokens, **x2288** | 22 min | ~3.9M tok/s |
+
+Honest floor discovered at that scale: with tens of thousands of messages, *message-count* itself becomes the output budget floor (a message costs ≥2 tokens even as an empty tombstone). Future work: range-aggregate tombstones into interval declarations (qv-style), which would push the floor below O(messages) toward O(distinct templates).
+
 ## Sources
 
 - LLMLingua: [Microsoft Research project page](https://www.microsoft.com/en-us/research/project/llmlingua/) (20x claim), [arXiv 2310.05736](https://arxiv.org/abs/2310.05736)

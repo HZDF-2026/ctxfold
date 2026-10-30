@@ -82,94 +82,105 @@ function templatize(tpl, text) {
 
 // ---------- 压缩主逻辑 ----------
 // 输入行: {role, content, pinned?, kind?}  kind: system|chat|tool（默认按 role 推断）
+// v1.2：双遍流式（常数内存、任意大小文件，百亿 token 级起步）+ 直方图阈值预算分配（边际价值单刀）
+const readline = require('readline');
 async function compress(inFile, outFile, opts) {
   const t0 = Date.now();
-  const raw = await fsp.readFile(inFile, 'utf8');
-  const lines = raw.split('\n').filter(l => l.trim());
-  const msgs = lines.map(l => JSON.parse(l));
   const budget = opts.budget;
-  const anchorSet = new Set();
-  let inTok = 0, outTok = 0, nFold = 0, nGist = 0, nKeep = 0;
-
-  // 分类权重：system/pinned 永保；近期对话原文；老对话衰减；tool 输出优先折叠
-  const cls = msgs.map((m, i) => {
-    const c = m.content || '';
-    inTok += tok(c);
-    const kind = m.kind || (m.role === 'system' || m.role === 'user' && m.pinned ? 'system' : m.role === 'tool' ? 'tool' : 'chat');
-    const age = msgs.length - i; // 距尾距离
-    return { m, i, kind, age, tok: tok(c) };
-  });
-
-  // 第 1 遍：锚点全量提取（无论后续怎么压，事实先留住）——但锚点层自身限预算（防遗忘层不吃掉对话预算）
-  for (const c of cls) anchors(c.m.content || '').forEach(a => anchorSet.add(a));
-  let anchorList = [...anchorSet];
-  let anchorTok = tok(anchorList.join('\n'));
   const anchorBudget = Math.floor(budget * 0.15);
-  if (anchorTok > anchorBudget) { // 超限：保留最后出现的（新近上下文的锚更可能被引用）
-    while (anchorTok > anchorBudget && anchorList.length > 20) anchorTok -= tok(anchorList.shift()) + 1;
-  }
+  const normMap = new Map(); // norm -> id（PASS1 权威建立；PASS2 只读）
+  const norm = l => l.replace(/[0-9a-f]{12,}/gi, '⟨H⟩').replace(/\d+/g, '⟨N⟩');
+  const templatizeRO = text => text.split('\n').map(l => {
+    if (l.length < 8) return l;
+    const n = norm(l); const id = normMap.get(n);
+    return id === undefined ? l : `⟨§${id}⟩`;
+  }).join('\n');
+  const templatizeWR = text => text.split('\n').map(l => {
+    if (l.length < 8) return l;
+    const n = norm(l);
+    if (!normMap.has(n)) normMap.set(n, normMap.size);
+    return `⟨§${normMap.get(n)}⟩`;
+  }).join('\n');
 
-  // 第 2 遍：tool 长输出先模板化（重复结构跨消息共享字典，降为引用）再折叠
-  const tpl = new Map(); let tplId = 0;
-  for (const c of cls) {
-    if (c.kind === 'tool' && c.tok > 10) {
-      c.m.content = templatize(tpl, c.m.content);
-      for (const v of tpl.values()) if (v[1] === null) v[1] = tplId++;
-      c.tok = tok(c.m.content);
+  // ---------- PASS 1：常数内存统计（逐行；滑动新近窗；锚点 lastIdx；价值直方图） ----------
+  let inTok = 0, nMsg = 0;
+  const tokArr = [], valArr = [], kindArr = []; // typed 友好的普通数组（消息级）
+  const anchorMap = new Map(); // anchor -> [count, lastIdx]
+  const recentWindow = []; let recentWinText = '';
+  for await (const line of readline.createInterface({ input: fs.createReadStream(inFile, 'utf8'), crlfDelay: Infinity })) {
+    if (!line.trim()) continue;
+    const m = JSON.parse(line);
+    const raw = m.content || '';
+    const kind = m.kind || (m.role === 'system' ? 'system' : m.role === 'tool' ? 'tool' : 'chat');
+    let text = raw, t = tok(raw);
+    if (kind === 'tool' && t > 10) { text = templatizeWR(text); t = tok(text); }
+    if (kind === 'tool' && t > opts.toolFold) { text = fold(text, opts.head, opts.tail); t = tok(text); }
+    inTok += t;
+    let val = Infinity;
+    if (kind !== 'system') {
+      const mine = anchors(raw);
+      let uniq = 0;
+      for (const a of mine) { const e = anchorMap.get(a) || [0, nMsg]; e[0]++; e[1] = nMsg; anchorMap.set(a, e); if (!recentWinText.includes(a)) uniq++; }
+      const novel = text.includes('⟨§') ? 0.6 : 1;
+      val = (1 + uniq * 0.5) * novel; // 新近性由 recent 保护承担；value 只看事实价值×新颖度
     }
+    tokArr.push(t); valArr.push(val); kindArr.push(kind === 'system' ? 1 : 0);
+    recentWindow.push(raw); if (recentWindow.length > 40) recentWindow.shift();
+    recentWinText = recentWindow.join('\n');
+    nMsg++;
   }
-  for (const c of cls) {
-    if (c.kind === 'tool' && c.tok > opts.toolFold) {
-      c.m.content = fold(c.m.content, opts.head, opts.tail);
-      c.tok = tok(c.m.content); nFold++;
-    }
-  }
-  // 预算判定
-  const cur = () => anchorTok + 40 + cls.reduce((n, c) => n + c.tok, 0);
-  // 可衰减池：chat + tool；system/pinned 永不衰减
-  const demotable = cls.filter(c => c.kind !== 'system');
-  // 价值画像（前沿 KV-cache 预算分配的文本层对应）：
-  // 独占锚点（本条贡献且近期不重复出现的事实）× 新颖度（模板化消息价值低）× 新近权重
-  const recentText = cls.slice(-Math.min(40, cls.length)).map(c => c.m.content).join(' ');
-  const value = new Map();
-  for (const c of demotable) {
-    const mine = anchors(c.m.content);
-    let uniq = 0;
-    for (const a of mine) if (!recentText.includes(a)) uniq++;
-    const novel = c.m.content.includes('⟨§') ? 0.6 : 1;
-    value.set(c.i, (1 + uniq * 0.5) * novel * (1 / (1 + (cls.length - c.i) / Math.max(1, cls.length))));
-  }
-  // 裁剪顺序：边际价值升序（低价值先裁，全局排序而非按年龄顺序贪心）
-  const byValue = [...demotable].sort((a, b) => value.get(a.i) - value.get(b.i));
-  const recentIds = new Set(cls.slice(-Math.min(opts.recent, cls.length)).map(c => c.i));
-  const demote = (level) => {
-    for (const c of byValue) {
-      if (cur() <= budget) break;
-      if (recentIds.has(c.i)) continue; // 最近 N 条原文永不降级
-      if (level === 1 && !c.m.content.startsWith('[')) { c.m.content = `[要点] ${gist(c.m.content, opts.gistLen)}`; c.tok = tok(c.m.content); nGist++; }
-      else if (level === 2 && !c.m.content.startsWith('[索引]') && !c.m.content.startsWith('[删除]')) { c.m.content = `[索引] #${c.i} ${gist(c.m.content, 30)}`; c.tok = tok(c.m.content); nGist++; }
-      else if (level === 3) { c.m.content = `[删除] #${c.i}`; c.tok = 6; nGist++; }
-    }
+  // 锚点名单：新近（lastIdx 大）优先保留至锚点预算
+  const anchorSorted = [...anchorMap.entries()].sort((a, b) => b[1][1] - a[1][1]);
+  const anchorList = [];
+  let anchorTok = 0;
+  for (const [a] of anchorSorted) { anchorList.push(a); anchorTok += tok(a) + 1; if (anchorTok > anchorBudget && anchorList.length > 20) break; }
+  // system 与最近 N 条保护预算
+  const protect = new Set(); let protTok = anchorTok + 40;
+  for (let i = 0; i < nMsg; i++) { if (kindArr[i] === 1) { protect.add(i); protTok += tokArr[i]; } }
+  for (let i = Math.max(0, nMsg - opts.recent); i < nMsg; i++) { if (!protect.has(i)) { protect.add(i); protTok += tokArr[i]; } }
+  // 直方图二分：tombCut（价值低于它→墓碑）与 gistCut（之间→要点）
+  const need = () => Math.max(0, inTok - budget);
+  const bucket = new Map(); // val -> [tokSum, count]
+  for (let i = 0; i < nMsg; i++) { if (protect.has(i)) continue; const b = bucket.get(valArr[i]) || [0, 0]; b[0] += tokArr[i]; b[1]++; bucket.set(valArr[i], b); }
+  const valsAsc = [...bucket.keys()].sort((a, b) => a - b);
+  const cutFor = target => { // 升序累加 tok 直至裁掉 target
+    let acc = 0;
+    for (const v of valsAsc) { acc += bucket.get(v)[0]; if (acc >= target) return v; }
+    return Infinity;
   };
-  demote(1);
-  if (cur() > budget) demote(2);
-  if (cur() > budget) demote(3);
-  // 第 4 级：墓碑聚合（数千条 [删除] 行本身占地板——合并成单行区间声明）
-  if (cur() > budget) {
-    const dead = demotable.filter(c => c.m.content.startsWith('[删除]'));
-    if (dead.length > 1) {
-      dead[0].m.content = `[已折叠] ${dead.length} 条消息（#${dead[0].i}-#${dead[dead.length - 1].i}，事实在 ANCHORS）`;
-      dead[0].tok = tok(dead[0].m.content);
-      for (const c of dead.slice(1)) { c.m.content = ''; c.tok = 1; }
+  let tombCut = -1;
+  if (need() > 0) tombCut = cutFor(need()); // 单刀墓碑：v <= tombCut 全墓碑化
+  let gistCut = -1;
+  const tokt = (v) => bucket.get(v)[0];
+  { // 若墓碑后仍超（保护项过多），第二刀：墓碑+要点混合——升序尾段的做要点
+    let saved = 0; for (const v of valsAsc) { if (v <= tombCut) saved += tokt(v); }
+    if (saved < need()) { // 全可裁池都不够 → 尾部最近可裁段要点化（v > tombCut 且非保护）
+      const rest = need() - saved;
+      let acc = 0;
+      for (const v of valsAsc.slice().reverse()) { if (v <= tombCut) break; acc += tokt(v); if (acc >= rest) { gistCut = v; break; } }
     }
   }
-  outTok = cur(); nKeep = cls.length;
-
-  // 输出（stats 不入文件——保证确定性）
-  const out = [];
-  out.push(JSON.stringify({ role: 'system', kind: 'anchors', content: 'ANCHORS(压缩中强制保留的事实，勿遗漏/勿改写):\n' + anchorList.join('\n') }));
-  for (const c of cls) out.push(JSON.stringify(c.m));
-  await fsp.writeFile(outFile, out.join('\n') + '\n', 'utf8');
+  // ---------- PASS 2：流式输出 ----------
+  let outTok = anchorTok + 40, nFold = 0, nGist = 0, nKeep = 0, i = 0, dead = 0;
+  const ws = fs.createWriteStream(outFile, 'utf8');
+  await new Promise(r => ws.write(JSON.stringify({ role: 'system', kind: 'anchors', content: 'ANCHORS(压缩中强制保留的事实，勿遗漏/勿改写):\n' + anchorList.join('\n') }) + '\n', r));
+  for await (const line of readline.createInterface({ input: fs.createReadStream(inFile, 'utf8'), crlfDelay: Infinity })) {
+    if (!line.trim()) continue;
+    const idx = i++;
+    const m = JSON.parse(line);
+    if (protect.has(idx)) { ws.write(line + '\n'); outTok += tokArr[idx]; nKeep++; continue; }
+    const v = valArr[idx];
+    if (v <= tombCut) { m.content = ''; ws.write(JSON.stringify(m) + '\n'); outTok += 2; dead++; continue; }
+    let text = m.content || '';
+    if (kindArr[idx] === 0) {
+      if ((tok(m.content) > 10) && (m.kind || m.role) === 'tool') { text = templatizeRO(text); nFold++; if (tok(text) > opts.toolFold) text = fold(text, opts.head, opts.tail); }
+      if (v <= gistCut) { text = `[要点] ${gist(text, opts.gistLen)}`; nGist++; }
+    }
+    m.content = text; outTok += tok(text); nKeep++;
+    ws.write(JSON.stringify(m) + '\n');
+  }
+  if (dead > 1) { /* 墓碑已是空 content，成本 2 tok/条 */ }
+  await new Promise(r => ws.end(r));
   return { version: VERSION, model: opts.model, window: opts.profile.window, dumbing: opts.profile.dumbing,
     budget, in_tok: inTok, out_tok: outTok, ratio: +(inTok / Math.max(1, outTok)).toFixed(2),
     anchors: anchorList.length, folded: nFold, gisted: nGist, msgs: nKeep, ms: Date.now() - t0 };

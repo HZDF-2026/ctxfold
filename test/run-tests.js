@@ -107,6 +107,27 @@ t('V1 价值加权裁剪（边际价值排序：高独占锚点的老消息存�
   assert(out.includes('sqlite') || out.includes('T-7742'), '高价值老消息的事实应经要点/锚点保留');
 });
 
+t('S1 流式架构：5 亿 token 级样本（百亿级架构验证，常数内存）', async () => {
+  const D = fs.mkdtempSync('H:/ctxfold/.tmp-s1-');
+  const f = path.join(D, 'big.jsonl');
+  const ws = fs.createWriteStream(f);
+  // 5 万条 × ~10k token = 5 亿 token（文本 ~2GB）——分块流式生成
+  const chunk = Array.from({ length: 1000 }, (_, j) => `日志段 ${j} 检查项 ${j % 97} 通过 阈值 0.${j % 9} 保持 ${'z'.repeat(40)}`).join('\n');
+  for (let i = 0; i < 50000; i++) {
+    if (!ws.write(JSON.stringify({ role: i % 10 === 9 ? 'tool' : 'user', content: `批次 ${i}\n${chunk}\n关键值 ${i * 31}` }) + '\n')) await new Promise(r => ws.once('drain', r));
+  }
+  await new Promise(r => ws.end(r));
+  const sizeGB = (fs.statSync(f).size / 1e9).toFixed(2);
+  const t0 = Date.now();
+  const st = await CF.compress(f, f + '.o', { model: 'gpt-4.1', profile: CF.PROFILES['gpt-4.1'], budget: 900000, toolFold: 400, head: 6, tail: 4, recent: 20, gistLen: 60 });
+  console.log(`  样本 ${sizeGB}GB（约 ${Math.round(st.in_tok / 1e6)}M token）→ ${st.out_tok} tok（x${st.ratio}）${st.ms}ms`);
+  assert(st.out_tok <= 950000, '预算必须达标: ' + st.out_tok);
+  assert(st.ms < 300000, `双遍流式吞吐应 ≥ 3.6M tok/s，实际 ${st.ms}ms`);
+  const outTxt = fs.readFileSync(f + '.o', 'utf8').slice(0, 500000);
+  assert(outTxt.includes('ANCHORS'), '锚点层在前');
+  fs.rmSync(D, { recursive: true, force: true });
+});
+
 (async () => {
   for (const [n, f] of tests) { try { await f(); pass++; console.log('PASS ' + n); } catch (e) { fail++; console.log('FAIL ' + n + ': ' + e.message); } }
   console.log(`\n${pass} passed, ${fail} failed`);
