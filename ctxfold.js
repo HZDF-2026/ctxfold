@@ -6,7 +6,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
-const VERSION = '1.0.0';
+const VERSION = '1.2.0';
 
 // ---------- 模型 profile：窗口能力 + 建议工作预算 + 降智阈值（超过则质量衰减区） ----------
 const PROFILES = {
