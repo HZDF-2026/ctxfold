@@ -6,7 +6,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
-const VERSION = '1.2.0';
+const VERSION = '2.0.0';
 
 // ---------- 模型 profile：窗口能力 + 建议工作预算 + 降智阈值（超过则质量衰减区） ----------
 const PROFILES = {
@@ -35,16 +35,21 @@ function tok(s) {
 
 // ---------- 锚点提取：这些事实在压缩中永不丢失（防遗忘/防幻觉层） ----------
 const ANCHOR_RX = [
-  /[A-Za-z]:[\\/][^\s"'）)】\]，,；;]+/g,                        // Windows 路径
+  /[A-Za-z]:[\\/][^\s"'。）)】\]，,；;]+/g,                      // Windows 路径（。不入路径）
   /(?:\/[A-Za-z0-9_.-]+){2,}/g,                                  // POSIX 路径
-  /https?:\/\/[^\s"'）)】\]，,；;]+/g,                          // URL
+  /https?:\/\/[^\s"'。）)】\]，,；;]+/g,                        // URL
   /\b[0-9a-f]{40,64}\b/g,                                        // sha1/sha256
   /\b\d[\d,.]{2,}(?:\s?(?:GB|MB|KB|TB|k|ms|s|min|hour|天|小时|分钟|秒|元|美元|%)|\s*%(?!\w))?/gi, // 数字+单位
-  /\b(?:gh|npm|pip|node|qv|docker|git)\s+\S+/g,                  // 命令锚
+  /\b(?:gh|npm|pip|node|qv|docker|git)\s+\S+/g,                 // 命令锚
+  /\b[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*){1,5}\b/g, // 点分键（handoff.enabled、ctx.llm.stream）
+  /`([^`\n]{2,160})`/g,                                          // 反引号代码片段
 ];
 function anchors(text) {
   const found = new Set();
-  for (const rx of ANCHOR_RX) { const m = text.match(rx); if (m) m.slice(0, 40).forEach(x => found.add(x.trim())); }
+  for (const rx of ANCHOR_RX) {
+    const m = text.match(rx);
+    if (m) m.slice(0, 40).forEach(x => found.add((x.startsWith('`') ? x.slice(1, -1) : x).trim()));
+  }
   return [...found].slice(0, 200);
 }
 
@@ -265,13 +270,65 @@ async function main() {
   } else if (cmd === 'tok') {
     const txt = await fsp.readFile(arg('--in'), 'utf8');
     console.log(tok(txt));
+  } else if (cmd === 'memory') {
+    return cmdMemory(a, arg, opts);
   } else {
-    console.log(`ctxfold ${VERSION} — Agent 上下文管理与 KV 压缩
+    console.log(`ctxfold ${VERSION} — Agent 上下文管理与 KV 压缩 · RSI 记忆管理
 用法: fold --in session.jsonl [--out o.jsonl] [--model M] [--budget N] [--recent N] [--tool-fold N]
+      handoff --in session.jsonl [--out HANDOFF.md]
+      memory distill --in session.jsonl|f.txt --dir <记忆库> [--topic T] [--max-facts N]
+      memory recall  --query "任务文本" --dir <记忆库> [--budget 800] [--k 12]
+      memory curate --dir <记忆库> [--retention-days 180]
+      memory show|verify --dir <记忆库>
       anchors --in f.txt | tok --in f.txt
 模型 profile: ${Object.keys(PROFILES).join(', ')}
-确定性规则压缩（零 LLM 调用）；锚点(路径/URL/哈希/数字+单位/命令)强制保留防遗忘；流式秒级处理。`);
+确定性规则压缩（零 LLM 调用）；锚点(路径/URL/哈希/数字+单位/命令)强制保留防遗忘；流式秒级处理。
+memory：混合记忆层（Markdown 权威 + sqlite/json 派生索引）——沉淀/召回/策展，任何 agent 可直接读写。`);
   }
 }
-if (require.main === module) main().catch(e => { console.error('ctxfold: ' + (e.stack || e.message)); process.exit(1); });
+
+// ---------- memory 子命令：通用 Agent RSI 记忆管理 ----------
+async function cmdMemory(a, arg) {
+  const { MemoryStore, distill } = require('./memory.js');
+  const sub = a[1];
+  const dir = arg('--dir', path.join(require('os').homedir(), '.ctxfold', 'memory'));
+  const store = await new MemoryStore(dir).open();
+  if (sub === 'distill') {
+    const inFile = arg('--in');
+    if (!inFile && a.includes('--text')) {
+      const t = arg('--text');
+      const r = await distill(store, t, { topic: arg('--topic'), maxFacts: +arg('--max-facts', '40') });
+      return ok(`沉淀 → 主题 "${r.topic}"：facts ${r.facts}｜lessons ${r.lessons}｜decisions ${r.decisions}（新增 ${r.added}，合并命中 ${r.merged}）`);
+    }
+    if (!inFile) die('用法: ctxfold memory distill --in session.jsonl --dir <记忆库> [--topic T]');
+    const r = await distill(store, inFile, { topic: arg('--topic'), maxFacts: +arg('--max-facts', '40') });
+    ok(`沉淀 → 主题 "${r.topic}"：facts ${r.facts}｜lessons ${r.lessons}｜decisions ${r.decisions}（新增 ${r.added}，合并命中 ${r.merged}）`);
+    ok(`记忆库: ${dir}`);
+  } else if (sub === 'recall') {
+    const q = arg('--query') || a[2];
+    if (!q) die('用法: ctxfold memory recall --query "任务文本" --dir <记忆库> [--budget 800] [--k 12]');
+    const picked = store.recall(q, { budget: +arg('--budget', '800'), k: +arg('--k', '12') });
+    const md = store.renderRecall(picked, q);
+    if (md) console.log(md); else ok('（无相关记忆）');
+  } else if (sub === 'curate') {
+    const r = await store.curate({ retentionDays: +arg('--retention-days', '180') });
+    ok(`策展完成：合并 ${r.merged}｜归档 ${r.archived}｜留存 ${r.kept}`);
+  } else if (sub === 'show') {
+    console.log(JSON.stringify(store.stats(), null, 2));
+  } else if (sub === 'verify') {
+    const v = store.verify();
+    console.log(JSON.stringify(v, null, 2));
+    if (!v.ok) process.exitCode = 1;
+  } else if (sub === 'forget') {
+    const id = arg('--id');
+    if (!id) die('用法: ctxfold memory forget --id <条目id>');
+    ok((await store.forget(id)) ? `已删除 ${id}` : `未找到 ${id}`);
+  } else {
+    die('子命令: distill | recall | curate | show | verify | forget');
+  }
+}
+// 导出必须先于 CLI 入口赋值：memory 子命令会在模块求值尾段 require('./memory.js')，
+// 而 memory.js 反向 require 本模块——晚于此处赋值它会拿到不完整导出（循环依赖陷阱）。
 module.exports = { tok, anchors, fold, gist, PROFILES, compress };
+// 记忆层请直接 require('./memory.js')；CLI 的 memory 子命令在运行时惰性加载。
+if (require.main === module) main().catch(e => { console.error('ctxfold: ' + (e.stack || e.message)); process.exit(1); });
