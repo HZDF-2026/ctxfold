@@ -194,14 +194,15 @@ async function cmdHandoff(inFile, outFile, opts) {
   const tmpF = inFile + '.folded.tmp';
   const st = await compress(inFile, tmpF, { ...opts, budget: Math.min(opts.budget, 3000), recent: 6, gistLen: 160 });
   const folded = (await fsp.readFile(tmpF, 'utf8')).split('\n').filter(l => l.trim());
-  let anchorsTxt = '', task = [], recent = [];
-  let i = 0;
+  let anchorsTxt = '';
+  const msgs = [];
   for (const line of folded) {
     const m = JSON.parse(line);
     if (m.kind === 'anchors') { anchorsTxt = m.content; continue; }
-    if (i++ < 6) { recent.push(`- ${(m.role || '?')}: ${gist(m.content, 200)}`); continue; }
-    if (m.content && m.content.startsWith('[要点]')) task.push(`- ${m.content.slice(5, 165)}`);
+    msgs.push(m);
   }
+  const recent = msgs.slice(-6).map(m => `- ${(m.role || '?')}: ${gist(m.content || '', 220)}`);
+  const task = msgs.filter(m => m.content && m.content.startsWith('[要点]')).map(m => `- ${m.content.slice(5, 165)}`);
   const md = [
     `# 会话交接 (HANDOFF)`,
     `> 由 ctxfold ${VERSION} 确定性生成（${st.in_tok} tok → ${st.out_tok} tok，x${st.ratio}）。新会话读本文件即可续作，勿再加载原始历史。`,
@@ -226,6 +227,8 @@ async function cmdHandoff(inFile, outFile, opts) {
   ok(`交接文件: ${outFile}（${mdTok} tok，原 ${st.in_tok} tok，x${(st.in_tok / mdTok).toFixed(0)}，${Date.now() - t0}ms）`);
   return { mdTok, st };
 }
+const die = m => { console.error('ctxfold: ' + m); process.exit(1); };
+const ok = m => { console.log(m); };
 
 // ---------- CLI ----------
 async function main() {
@@ -270,6 +273,5 @@ async function main() {
 确定性规则压缩（零 LLM 调用）；锚点(路径/URL/哈希/数字+单位/命令)强制保留防遗忘；流式秒级处理。`);
   }
 }
-const die = m => { console.error('ctxfold: ' + m); process.exit(1); };
-if (require.main === module) main().catch(e => die(e.stack || e.message));
+if (require.main === module) main().catch(e => { console.error('ctxfold: ' + (e.stack || e.message)); process.exit(1); });
 module.exports = { tok, anchors, fold, gist, PROFILES, compress };
