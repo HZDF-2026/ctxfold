@@ -186,6 +186,47 @@ async function compress(inFile, outFile, opts) {
     anchors: anchorList.length, folded: nFold, gisted: nGist, msgs: nKeep, ms: Date.now() - t0 };
 }
 
+// ---------- 会话交接压缩（handoff）：长会话 → 一份固定格式的交接文件 ----------
+// 定位（来自外部 agent 评审）：不接管实时上下文；用于会话交接——新会话只读交接文件即可续作。
+// 固定 markdown 结构规避 token 切分方式变化导致的模型忽略（dsh 内置 compaction 的已知痛点）。
+async function cmdHandoff(inFile, outFile, opts) {
+  const t0 = Date.now();
+  const tmpF = inFile + '.folded.tmp';
+  const st = await compress(inFile, tmpF, { ...opts, budget: Math.min(opts.budget, 3000), recent: 6, gistLen: 160 });
+  const folded = (await fsp.readFile(tmpF, 'utf8')).split('\n').filter(l => l.trim());
+  let anchorsTxt = '', task = [], recent = [];
+  let i = 0;
+  for (const line of folded) {
+    const m = JSON.parse(line);
+    if (m.kind === 'anchors') { anchorsTxt = m.content; continue; }
+    if (i++ < 6) { recent.push(`- ${(m.role || '?')}: ${gist(m.content, 200)}`); continue; }
+    if (m.content && m.content.startsWith('[要点]')) task.push(`- ${m.content.slice(5, 165)}`);
+  }
+  const md = [
+    `# 会话交接 (HANDOFF)`,
+    `> 由 ctxfold ${VERSION} 确定性生成（${st.in_tok} tok → ${st.out_tok} tok，x${st.ratio}）。新会话读本文件即可续作，勿再加载原始历史。`,
+    ``,
+    `## 一、近期上下文（原文要点，最近 6 条）`,
+    ...recent,
+    ``,
+    `## 二、历史要点（按边际价值保留）`,
+    ...task.slice(0, 30),
+    ``,
+    `## 三、关键事实（锚点层，勿遗漏/勿改写）`,
+    anchorsTxt.replace(/^.*:\n/, ''),
+    ``,
+    `## 四、恢复指引`,
+    `- 优先级：按「近期上下文」最后的未完成事项继续`,
+    `- 有疑义先查「关键事实」段（路径/参数/开关/数字原样保留）`,
+    `- 需要更早细节时读原始归档（本文件只保证交接所需）`,
+  ].join('\n');
+  await fsp.writeFile(outFile, md, 'utf8');
+  fsp.unlink(tmpF).catch(() => {});
+  const mdTok = tok(md);
+  ok(`交接文件: ${outFile}（${mdTok} tok，原 ${st.in_tok} tok，x${(st.in_tok / mdTok).toFixed(0)}，${Date.now() - t0}ms）`);
+  return { mdTok, st };
+}
+
 // ---------- CLI ----------
 async function main() {
   const a = process.argv.slice(2);
@@ -211,6 +252,10 @@ async function main() {
     console.log(`${st.in_tok} tok → ${st.out_tok} tok（x${st.ratio}，${st.ms}ms）｜折叠 ${st.folded} 条工具输出｜降级 ${st.gisted} 条老消息｜锚点 ${st.anchors} 个`);
     if (st.in_tok > profile.dumbing) console.log(`⚠ 输入 ${st.in_tok} tok 已超降智阈值 ${profile.dumbing / 1000}k——输出已压至 ${st.out_tok} tok 阈内，质量衰减风险解除`);
     console.log(`输出: ${outFile}`);
+  } else if (cmd === 'handoff') {
+    const inFile = arg('--in');
+    if (!inFile) die('用法: ctxfold handoff --in session.jsonl [--out HANDOFF.md] [--model M]');
+    return cmdHandoff(inFile, arg('--out', path.join(path.dirname(inFile), 'HANDOFF.md')), opts);
   } else if (cmd === 'anchors') {
     const txt = await fsp.readFile(arg('--in'), 'utf8');
     console.log(anchors(txt).join('\n'));

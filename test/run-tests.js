@@ -128,6 +128,27 @@ t('S1 流式架构：5 亿 token 级样本（百亿级架构验证，常数内�
   fs.rmSync(D, { recursive: true, force: true });
 });
 
+t('H1 会话交接压缩（handoff：14MB → ≤3k 固定格式交接文件，DSH 评审定位）', async () => {
+  const D = tmp();
+  const f = path.join(D, 'session.jsonl');
+  const lines = [];
+  for (let i = 0; i < 3000; i++) lines.push(JSON.stringify({ role: 'user', content: `迭代 ${i}：调整配置参数 ${i} 后回归通过。${'详情'.repeat(50)}` }));
+  lines.push(JSON.stringify({ role: 'user', content: '配置变更：handoff.enabled 设为 true，超时 25000 ms，工具路径 H:/bin/jq.exe，预算 1299 元' }));
+  fs.writeFileSync(f, lines.join('\n') + '\n');
+  const { execFileSync } = require('child_process');
+  const out = path.join(D, 'HANDOFF.md');
+  const stdout = execFileSync('node', [BIN, 'handoff', '--in', f, '--out', out], { encoding: 'utf8' });
+  console.log('  ' + stdout.trim().split('\n')[0]);
+  const md = fs.readFileSync(out, 'utf8');
+  const mdTok = CF.tok(md);
+  assert(mdTok <= 3200, '交接文件应 ≤3k tok: ' + mdTok);
+  assert(md.includes('handoff.enabled'), '关键事实1 保留');
+  assert(md.includes('25000'), '关键事实2 保留');
+  assert(md.includes('jq.exe'), '关键事实3 保留');
+  assert(md.includes('# 会话交接'), '固定格式');
+  assert(md.includes('## 四、恢复指引'), '恢复段存在');
+});
+
 (async () => {
   for (const [n, f] of tests) { try { await f(); pass++; console.log('PASS ' + n); } catch (e) { fail++; console.log('FAIL ' + n + ': ' + e.message); } }
   console.log(`\n${pass} passed, ${fail} failed`);
